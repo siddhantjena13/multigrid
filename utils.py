@@ -102,7 +102,7 @@ def generate_parameters(mode, domain, debug=False, seed=None, with_expert=None, 
 
 
 def plot_single_frame(frame_id, full_env_image, agents_partial_images, actions, rewards, action_dict,
-                      fig_dir, expt_name, figsize=(10,10), shared_ylim=False, min_ylim=.0001):
+                      fig_dir, expt_name, figsize=(10,10), shared_ylim=False, min_ylim=.0001, predicted_actions=None):
     # Seaborn palette.
     sns.set()
     color_palette = sns.palettes.color_palette()

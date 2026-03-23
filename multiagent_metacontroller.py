@@ -14,6 +14,7 @@ import torch.nn as nn
 import wandb
 
 from utils import plot_single_frame, make_video, extract_mode_from_path
+from ppo_agent import PPOAgent
 
 class MultiAgent():
     """This is a meta agent that creates and controls several sub agents. If model_others is True,
@@ -21,33 +22,19 @@ class MultiAgent():
     other agents. """
 
     def __init__(self, config, env, device, training=True, with_expert=None, debug=False):
-        raise NotImplementedError("How should I initialize this class?")
+        self.config = config
+        self.env = env
+        self.device = device
+        self.training = training 
+        self.with_expert = with_expert
+        self.debug = debug 
+        self.total_steps = 0
+        self.agents = []
+        self.n_agents = config.n_agents
+        self.model_others = False
     
     def run_one_episode(self, env, episode, log=True, train=True, save_model=True, visualize=False):
-        raise NotImplementedError("What should be initialized at the beginning of an episode?")
-
-        if visualize:
-            viz_data = self.init_visualization_data(env, state)
-
-        raise NotImplementedError("What needs to be initialized here?")
-        while not done:
-            self.total_steps += 1
-            # TODO: implement me
-            raise NotImplementedError("What should go here?")
-
-            if visualize:
-                viz_data = self.add_visualization_data(viz_data, env, state, actions, next_state)
-
-            raise NotImplementedError("What happens here?")
-
-        # Logging and checkpointing
-        if log: self.log_one_episode(episode, t, rewards)
-        self.print_terminal_output(episode, np.sum(rewards))
-        self.save_model_checkpoints(episode)
-
-        if visualize:
-            viz_data['rewards'] = np.array(rewards)
-            return viz_data
+        raise NotImplementedError("Subclasses must implement run_one_episode")
 
     def save_model_checkpoints(self, episode):
         if episode % self.config.save_model_episode == 0:
@@ -128,16 +115,14 @@ class MultiAgent():
         make_video(video_path, mode + '_trajectory_video')
 
     def visualize_one_frame(self, t, viz_data, action_dict, video_path, model_name):
-        plot_single_frame(t, 
-                          viz_data['full_images'][t], 
-                          viz_data['agents_partial_images'][t], 
-                          viz_data['actions'][t], 
-                          viz_data['rewards'], 
-                          action_dict, 
-                          video_path, 
-                          self.config.model_name, 
-                          predicted_actions=viz_data['predicted_actions'], 
-                          all_actions=viz_data['actions'])
+        plot_single_frame(t,
+                          viz_data['full_images'][t],
+                          viz_data['agents_partial_images'][t],
+                          viz_data['actions'][t],
+                          viz_data['rewards'],
+                          action_dict,
+                          video_path,
+                          self.config.model_name)
 
     def load_models(self, model_path=None):
         for i in range(self.n_agents):
@@ -148,3 +133,98 @@ class MultiAgent():
                 self.agents[i].load_model()
 
 
+class PPOMultiAgent(MultiAgent):
+    # this is the actual implementation of MultiAgent using PPO
+    # basically creates one PPOAgent per agent and coordinates them
+
+    def __init__(self, config, env, device, training=True, with_expert=None, debug=False):
+        super().__init__(config, env, device, training, with_expert, debug)
+
+        # reset env once just to get the observation shape for building networks
+        obs = env.reset()
+        n_actions = config.n_actions
+
+        for i in range(self.n_agents):
+            agent_obs = self.get_agent_state(obs, i)
+            agent = PPOAgent(config, agent_obs, n_actions, self.n_agents, i, device)
+            self.agents.append(agent)
+
+    def get_agent_state(self, state, agent_id):
+        # image is per-agent (each sees its own partial view)
+        # direction includes all agents so the network can condition on everyone's heading
+        return {
+            'image': state['image'][agent_id],
+            'direction': state['direction'],
+        }
+
+    def run_one_episode(self, env, episode, log=True, train=True, save_model=True, visualize=False):
+        self.env = env
+        done = False
+        rewards = []
+        t = 0
+        state = env.reset()
+
+        if visualize:
+            viz_data = self.init_visualization_data(env, state)
+
+        while not done:
+            self.total_steps += 1
+
+            # get actions from all agents
+            actions = []
+            logprobs = []
+            values = []
+            for i in range(self.n_agents):
+                obs = self.get_agent_state(state, i)
+                action, logprob, value = self.agents[i].act(obs)
+                actions.append(action)
+                logprobs.append(logprob)
+                values.append(value)
+
+            # step the environment with all actions at once
+            next_state, step_rewards, done, _ = env.step(actions)
+            rewards.append(step_rewards)
+
+            # store this timestep for each agent
+            for i in range(self.n_agents):
+                obs = self.get_agent_state(state, i)
+                self.agents[i].store(obs, actions[i], step_rewards[i], done, logprobs[i], values[i])
+
+            if visualize:
+                viz_data = self.add_visualization_data(viz_data, env, state, actions, next_state)
+
+            state = next_state
+            t += 1
+
+        # update each agent's network now that episode is done
+        if train:
+            for i in range(self.n_agents):
+                next_obs = self.get_agent_state(state, i)
+                self.agents[i].update(next_obs, done)
+
+        if log:
+            self.log_one_episode(episode, t, rewards)
+        self.print_terminal_output(episode, np.sum(rewards))
+        if save_model:
+            self.save_model_checkpoints(episode)
+
+        if visualize:
+            viz_data['rewards'] = np.array(rewards)
+            return viz_data
+
+    def update_models(self):
+        # ppo updates at end of each episode (handled in run_one_episode) so nothing here
+        pass
+
+    def log_one_episode(self, episode, t, rewards):
+        rewards_arr = np.array(rewards)  # shape: (timesteps, n_agents)
+
+        log_dict = {
+            'episode/x_axis': episode,
+            'episode/total_reward': float(np.sum(rewards_arr)),
+            'episode/episode_length': t,
+        }
+        for i in range(self.n_agents):
+            log_dict[f'episode/agent_{i}_reward'] = float(np.sum(rewards_arr[:, i]))
+
+        wandb.log(log_dict)
